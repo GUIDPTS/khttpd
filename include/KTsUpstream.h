@@ -71,6 +71,7 @@ public:
 	bool IsMultiStream() override {
 		return us->IsMultiStream();
 	}
+	void set_duplex(bool enabled) override { us->set_duplex(enabled); }
 	bool IsNew() override {
 		return us->IsNew();
 	}

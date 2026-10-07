@@ -19,6 +19,7 @@ public:
 	}
 	virtual bool response_header(kgl_header_type know_header, const char* val, int val_len, bool lock_value) override {
 		assert(know_header < kgl_header_unknow);
+		note_response_header(kgl_header_type_string[know_header].value.data, (int)kgl_header_type_string[know_header].value.len, val, val_len);
 		rc.head_append(pool, kgl_header_type_string[know_header].http11.data, (uint16_t)kgl_header_type_string[know_header].http11.len);
 		if (lock_value) {
 			rc.head_append(pool, val, val_len);
@@ -30,6 +31,7 @@ public:
 		return true;
 	}
 	virtual bool response_header(const char* name, int name_len, const char* val, int val_len) override {
+		note_response_header(name, name_len, val, val_len);
 		int len = name_len + val_len + 4;
 		char* buf = (char*)kgl_pnalloc(pool, len);
 		char* hot = buf;

@@ -94,6 +94,7 @@ public:
 	virtual bool IsMultiStream() {
 		return false;
 	}
+	virtual void set_duplex(bool enabled) {}
 	virtual void set_time_out(int tmo) {
 	}
 

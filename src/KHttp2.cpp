@@ -482,10 +482,20 @@ u_char* KHttp2::state_process_header(u_char* pos, u_char* end) {
 	if (header->name.data == NULL || header->value.data == NULL) {
 		return state_header_complete(pos, end);
 	}
-	if (!client_model && !kgl_http_v2_valid_header(header)) {
+	if (!state.validation.field(header->name.data, (int)header->name.len, header->value.data,
+		(int)header->value.len, true, !client_model, stream->parsed_header)) {
 		klog(KLOG_WARNING, "http2 client sent invalid header on stream [%u]\n", state.sid);
 		terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
 		return state_header_complete(pos, end);
+	}
+	if (!stream->parsed_header && khttp_field_equal(header->name.data, (int)header->name.len, "content-length")) {
+		int64_t length;
+		if (!khttp_parse_length(header->value.data, (int)header->value.len, &length) ||
+			(stream->input_left >= 0 && stream->input_left != length)) {
+			terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+			return state_header_complete(pos, end);
+		}
+		stream->input_left = length;
 	}
 	if (!client_model && !stream->parsed_header &&
 		header->name.len == cookie.len &&
@@ -506,7 +516,10 @@ u_char* KHttp2::state_process_header(u_char* pos, u_char* end) {
 #ifdef ENABLE_UPSTREAM_HTTP2
 	if (client_model) {
 		kassert(state.stream->node);
-		stream->us->parse_header(header->name.data, (int)header->name.len, header->value.data, (int)header->value.len);
+		if (!stream->us->parse_header(header->name.data, (int)header->name.len, header->value.data, (int)header->value.len,
+			(state.flags & KGL_HTTP_V2_END_STREAM_FLAG) != 0)) {
+			terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+		}
 		return state_header_complete(pos, end);
 	}
 #endif	
@@ -607,21 +620,48 @@ u_char* KHttp2::state_skip_padded(u_char* pos, u_char* end) {
 }
 
 bool KHttp2::on_header_success(KHttp2Context* stream) {
+	if (!stream->is_available()) return true;
+	if (!state.validation.complete(!client_model, stream->parsed_header) ||
+		(stream->parsed_header && !(state.flags & KGL_HTTP_V2_END_STREAM_FLAG))) {
+		terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+		return true;
+	}
+	if (state.flags & KGL_HTTP_V2_END_STREAM_FLAG) {
+		// HEAD and 304 describe a representation, without transmitting that body.
+		bool no_body = client_model && stream->input_left > 0 &&
+			(state.validation.status == 304 || stream->head_request);
+		if (stream->input_left > 0 && !no_body) {
+			terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+			return true;
+		}
+		stream->in_closed = 1;
+	}
 
 #ifdef ENABLE_UPSTREAM_HTTP2
 	if (client_model) {
-		if (stream->has_upgrade) {
+		if (stream->has_upgrade && !stream->parsed_header && state.validation.status == 200) {
 			kgl_http2_event* re = stream->read_wait;
 			if (re) {
+				const auto& protocol = stream->us->get_upgrade_protocol();
+				re->header(stream->us, re->header_arg, _KS("Upgrade"), protocol.data(), (int)protocol.size(), false);
 				re->header(stream->us, re->header_arg, _KS("Connection"), _KS("Upgrade"), false);
 			}
 		}
 		if (stream->is_100_continue) {
 			stream->is_100_continue = 0;
+			stream->input_left = -1;
+			if ((state.flags & KGL_HTTP_V2_END_STREAM_FLAG) || ++stream->interim_count > 8) {
+				terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+				return true;
+			}
 			if (stream->read_wait) {
 				//不能删除read_wait,因为还要继续读.
 				stream->read_wait->on_read(0);
 			}
+			return true;
+		}
+		if (!stream->us->finish_headers()) {
+			terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
 			return true;
 		}
 		stream->parsed_header = 1;
@@ -871,8 +911,11 @@ void KHttp2::write_end(KHttp2Context* ctx) {
 		send_header(ctx, true);
 		return;
 	}
-	//只有不明长度，才需要调用write_end
-	assert(ctx->content_left == -1);
+	if (ctx->content_left > 0) { shutdown(ctx); return; }
+	if (ctx->send_header && ctx->write_trailer) {
+		send_header(ctx, true);
+		return;
+	}
 	//printf("ctx id=[%d] out_closed\n", ctx->node->id);	
 	http2_buff* new_buf = get_frame(ctx->node->id, 0, KGL_HTTP_V2_DATA_FRAME, (ctx->send_header ? 0 : KGL_HTTP_V2_END_STREAM_FLAG));
 	if (new_buf == NULL) {
@@ -1246,6 +1289,8 @@ bool KHttp2::add_status(KHttp2Context* ctx, uint16_t status_code) {
 	return true;
 }
 bool KHttp2::add_header(KHttp2Context* ctx, kgl_header_type name, const char* val, hlen_t val_len) {
+	while (val_len && (*val == ' ' || *val == '\t')) { ++val; --val_len; }
+	while (val_len && (val[val_len-1] == ' ' || val[val_len-1] == '\t')) --val_len;
 	if (ctx->send_header == NULL) {
 		ctx->send_header = new KHttp2HeaderFrame;
 	}
@@ -1273,6 +1318,11 @@ bool KHttp2::add_header_cookie(KHttp2Context* ctx, const char* val, hlen_t val_l
 	return true;
 }
 bool KHttp2::add_header(KHttp2Context* ctx, const char* name, hlen_t name_len, const char* val, hlen_t val_len) {
+	// HTTP/2 field values cannot start or end with optional whitespace.
+	if (name_len && name[0] != ':') {
+		while (val_len && (*val == ' ' || *val == '\t')) { ++val; --val_len; }
+		while (val_len && (val[val_len-1] == ' ' || val[val_len-1] == '\t')) --val_len;
+	}
 	if (ctx->send_header == NULL) {
 		ctx->send_header = new KHttp2HeaderFrame;
 	}
@@ -1421,10 +1471,21 @@ void KHttp2::server(kconnection* c) {
 	}
 	start_read();
 }
+void KHttp2::cancel_read(KHttp2Context* ctx) {
+	ctx->skip_data = 1;
+	if (ctx->read_wait) {
+		auto wait=ctx->read_wait;
+		ctx->read_wait=nullptr;
+		FlushQueue(ctx);
+		wait->on_read(-1);
+		delete wait;
+	}
+}
 int KHttp2::read(KHttp2Context* http2_ctx, char* buf, int len) {
 	kassert(kselector_is_same_thread(c->st.base.selector));
 	assert(http2_ctx);
 	assert(http2_ctx->parsed_header);
+	if (http2_ctx->skip_data) return -1;
 	if (http2_ctx->write_wait && IS_WRITE_WAIT_FOR_HUP(http2_ctx->write_wait)) {
 		//remove read_hup
 		delete http2_ctx->write_wait;
@@ -1437,14 +1498,14 @@ int KHttp2::read(KHttp2Context* http2_ctx, char* buf, int len) {
 		FlushQueue(http2_ctx);
 	}
 #ifdef ENABLE_UPSTREAM_HTTP2
-	if (client_model) {
+	if (client_model && !http2_ctx->duplex) {
 #ifndef NDEBUG
-		if (http2_ctx->content_left >= 0 && !http2_ctx->has_expect) {
+		if (http2_ctx->content_left >= 0 && !http2_ctx->has_expect && !http2_ctx->defer_end) {
 			assert(http2_ctx->content_left == 0);
 			assert(http2_ctx->out_closed);
 		}
 #endif
-		if (http2_ctx->out_closed == 0 && (!http2_ctx->has_upgrade || http2_ctx->has_expect)) {
+		if (http2_ctx->out_closed == 0 && !http2_ctx->defer_end && (!http2_ctx->has_upgrade || http2_ctx->has_expect)) {
 			http2_ctx->out_closed = 1;
 			http2_buff* new_buf = get_frame(http2_ctx->node->id, 0, KGL_HTTP_V2_DATA_FRAME, KGL_HTTP_V2_END_STREAM_FLAG);
 			if (new_buf) {
@@ -1777,6 +1838,13 @@ u_char* KHttp2::state_read_data(u_char* pos, u_char* end) {
 	}
 
 	if (size) {
+		if (stream->input_left >= 0) {
+			if ((uint64_t)stream->input_left < size) {
+				terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+				return state_skip_padded(pos, end);
+			}
+			stream->input_left -= size;
+		}
 		//TODO: read size data
 		//printf("read data length=[%d]\n", size);
 		if (stream->read_buffer == NULL) {
@@ -1801,6 +1869,10 @@ u_char* KHttp2::state_read_data(u_char* pos, u_char* end) {
 	}
 
 	if (state.flags & KGL_HTTP_V2_END_STREAM_FLAG) {
+		if (stream->input_left > 0) {
+			terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+			return state_complete(pos, end);
+		}
 		stream->in_closed = 1;
 		kgl_http2_event* read_wait = stream->read_wait;
 		if (read_wait) {
@@ -1825,6 +1897,7 @@ u_char* KHttp2::state_headers(u_char* pos, u_char* end) {
 	KHttp2Node* node;
 	KHttp2Context* stream;
 	state.header_length = 0;
+	state.validation.reset();
 	state.continuation_frames = 0;
 	state.skip_field = 0;
 	padded = state.flags & KGL_HTTP_V2_PADDED_FLAG;
@@ -1905,7 +1978,6 @@ u_char* KHttp2::state_headers(u_char* pos, u_char* end) {
 		kassert(state.pool);
 		kassert(state.stream == NULL);
 		state.stream = stream;
-		stream->in_closed = state.flags & KGL_HTTP_V2_END_STREAM_FLAG;
 		return state_header_block(pos, end);
 	}
 #endif
@@ -1945,7 +2017,6 @@ u_char* KHttp2::state_headers(u_char* pos, u_char* end) {
 		state.keep_pool = 0;
 		kassert(state.stream == NULL);
 		state.stream = stream;
-		stream->in_closed = 1;
 		return state_header_block(pos, end);
 	}
 	if (state.sid <= last_peer_sid) {
@@ -1978,7 +2049,6 @@ u_char* KHttp2::state_headers(u_char* pos, u_char* end) {
 	if (stream == NULL) {
 		return this->close(true, KGL_HTTP_V2_INTERNAL_ERROR);
 	}
-	stream->in_closed = state.flags & KGL_HTTP_V2_END_STREAM_FLAG;
 	stream->node = node;
 	node->stream = stream;
 	assert(state.stream == NULL);
@@ -2057,6 +2127,10 @@ u_char* KHttp2::state_rst_stream(u_char* pos, u_char* end) {
 	}
 	stream = node->stream;
 
+	// A server may stop reading a request with NO_ERROR after its response
+	// has ended (RFC 9113 section 8.1). Preserve buffered response data and
+	// trailers until the upstream reader has consumed them.
+	bool completed_response = client_model && status == KGL_HTTP_V2_NO_ERROR && stream->in_closed;
 	switch (status) {
 
 	case KGL_HTTP_V2_CANCEL:
@@ -2085,13 +2159,13 @@ u_char* KHttp2::state_rst_stream(u_char* pos, u_char* end) {
 	}
 	stream->in_closed = 1;
 	stream->out_closed = 1;
-	stream->rst = 1;
+	stream->rst = !completed_response;
 	stream->RemoveQueue();
-	if (stream->read_buffer) {
+	if (stream->read_buffer && !completed_response) {
 		stream->read_buffer->clean();
 	}
 	if (re) {
-		re->on_read(-1);
+		re->on_read(completed_response ? 0 : -1);
 		delete re;
 	}
 	if (we) {

@@ -46,12 +46,18 @@ public:
 		return ctx->trailer->get_header();
 	}
 	virtual bool internal_response_status(uint16_t status_code) override {
+		if (status_code==101 && KBIT_TEST(data.flags,RQ_HAS_CONNECTION_UPGRADE)) status_code=200;
 		return http2->add_status(ctx, status_code);
 	}
 	virtual bool response_header(kgl_header_type know_header, const char* val, int val_len, bool lock_value) override {
+		if (know_header==kgl_header_connection || know_header==kgl_header_keep_alive ||
+			know_header==kgl_header_transfer_encoding || know_header==kgl_header_upgrade) return true;
 		return http2->add_header(ctx, know_header, val, (hlen_t)val_len);
 	}
 	virtual bool response_header(const char* name, int name_len, const char* val, int val_len) override {
+		if (khttp_field_equal(name,name_len,"connection") || khttp_field_equal(name,name_len,"keep-alive") ||
+			khttp_field_equal(name,name_len,"proxy-connection") || khttp_field_equal(name,name_len,"transfer-encoding") ||
+			khttp_field_equal(name,name_len,"upgrade") || khttp_field_equal(name,name_len,"te")) return true;
 		return http2->add_header(ctx, name, name_len, val, val_len);
 	}
 	virtual bool response_headers(const KHttpHeader* header) override {
@@ -64,8 +70,14 @@ public:
 		}
 		send_alt_svc_header();
 		ctx->set_content_length(body_size);
-		return http2->send_header(ctx, ctx->content_left == 0);
+		ctx->defer_end = 1;
+		return http2->send_header(ctx, false);
 	}
+	bool finish_read_body() override {
+		char extra;
+		return data.left_read == 0 && http2->read(ctx, &extra, 1) == 0;
+	}
+	bool need_request_end() override { return !ctx->in_closed || get_trailer() != nullptr; }
 	bool is_locked() override {
 		if (ctx->read_wait) {
 			return true;
@@ -98,6 +110,7 @@ public:
 	void shutdown() override {
 		return http2->shutdown(ctx);
 	}
+	void cancel_read() override { http2->cancel_read(ctx); }
 	kconnection* get_connection() override {
 		return http2->c;
 	}
@@ -113,8 +126,8 @@ public:
 		khttp_server_new_request(this, got);
 	}
 	bool response_trailer(const char* name, int name_len, const char* val, int val_len) override {
+		if (!khttp_valid_trailer(name, name_len, val, val_len) || ctx->out_closed || ctx->content_left > 0) return false;
 		if (!ctx->write_trailer) {
-			assert(ctx->content_left == -1);
 			if (ctx->send_header) {
 				http2->send_header(ctx, false);
 			}

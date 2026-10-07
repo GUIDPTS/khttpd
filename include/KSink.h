@@ -10,6 +10,7 @@
 #include "kfiber.h"
 #include "KHttpServer.h"
 #include "KHttpFieldValue.h"
+#include "KHttpValidation.h"
 #define KGL_FLAG_PRECONDITION_MASK  7
 //#define KGL_DEBUG_TIME
 #ifdef KGL_DEBUG_TIME
@@ -131,6 +132,9 @@ public:
 	virtual bool response_trailer(const char* name, int name_len, const char* val, int val_len) {
 		return true;
 	}
+	void enable_response_trailers() { response_has_trailers = true; }
+	virtual bool finish_read_body() { return data.left_read == 0; }
+	virtual bool need_request_end() { return get_trailer() != nullptr; }
 	virtual bool response_header(const char* name, int name_len, const char* val, int val_len) = 0;
 	virtual sockaddr_i* get_peer_addr() = 0;
 	virtual int64_t get_response_left() {
@@ -220,6 +224,7 @@ public:
 	}
 	virtual kselector* get_selector() = 0;
 	virtual void shutdown() = 0;
+	virtual void cancel_read() { shutdown(); }
 	virtual uint32_t get_server_model() = 0;
 	virtual KOPAQUE get_server_opaque() = 0;
 	virtual KHttpHeader* get_trailer() {
@@ -262,6 +267,7 @@ public:
 			return true;
 		}
 		KBIT_SET(data.flags, RQ_HAS_SEND_HEADER);
+		if (response_has_trailers && data.http_version == 0x101 && data.meth != METH_HEAD) body_len = -1;
 		if (likely(!is_status_code_no_body(data.status_code))) {
 			if (body_len >= 0) {
 				/* know content-length and response header */
@@ -315,8 +321,15 @@ public:
 			start_parse();
 			assert(!data.header);
 		}
+		if (!is_first || data.http_version >= 0x200) {
+			// Access rules also use this parser to synthesize headers after the
+			// request starts. HTTP/2 wire casing/order only applies while receiving.
+			if (data.url == nullptr) {
+				if (!input_headers.field(attr, attr_len, val, val_len, data.http_version >= 0x200, true)) return false;
+			} else if (!khttp_valid_field(attr, attr_len, val, val_len)) return false;
+		}
 #if defined(ENABLE_HTTP2) || defined(ENABLE_HTTP3)
-		if (data.http_version > 0x100 && *attr == ':') {
+		if (data.http_version >= 0x200 && *attr == ':') {
 			//pseudo header
 			if (kgl_mem_same(attr, attr_len, kgl_expand_string(":method"))) {
 				if (!data.parse_method(val, val_len)) {
@@ -328,8 +341,8 @@ public:
 				}
 				return true;
 			}
-			if (kgl_mem_same(attr, attr_len, kgl_expand_string(":version"))) {
-				return data.parse_http_version((u_char*)val, val_len);
+			if (kgl_mem_same(attr, attr_len, kgl_expand_string(":scheme"))) {
+				return true;
 			}
 			if (kgl_mem_same(attr, attr_len, kgl_expand_string(":path"))) {
 				if (data.raw_url.path || data.raw_url.param || val_len == 0 ||
@@ -344,7 +357,7 @@ public:
 			if (kgl_mem_same(attr, attr_len, _KS(":protocol"))) {
 				return data.add_header(pool, kgl_header_upgrade, val, val_len);
 			}
-			return true;
+			return false;
 		}
 #endif
 		if (is_first && data.http_version < 0x200) {
@@ -382,6 +395,7 @@ public:
 				//klog(KLOG_DEBUG, "httpparse:cann't parse http version [%s]\n", space);
 				return false;
 			}
+			if (data.http_version != 0x100 && data.http_version != 0x101) return false;
 			if (data.http_version > 0x100) {//data.http_major > 1 || (data.http_major == 1 && data.http_minor == 1)) {
 				KBIT_SET(data.flags, RQ_HAS_KEEP_CONNECTION);
 			}
@@ -469,6 +483,8 @@ public:
 		case 'H':
 		case 'h':
 			if (kgl_mem_case_same(attr, attr_len, kgl_expand_string("Host"))) {
+				if (host_seen) return false;
+				host_seen = true;
 				return data.parse_host(val, val_len);
 			}
 			break;
@@ -560,7 +576,7 @@ public:
 		case 't':
 			if (kgl_mem_case_same(attr, attr_len, kgl_expand_string("Transfer-Encoding"))) {
 				if (!kgl_mem_case_same(val, val_len, kgl_expand_string("chunked")) ||
-					KBIT_TEST(data.flags, RQ_HAS_CONTENT_LEN)) {
+					KBIT_TEST(data.flags, RQ_HAS_CONTENT_LEN | RQ_INPUT_CHUNKED) || data.http_version == 0x100) {
 					return false;
 				}
 				KBIT_SET(data.flags, RQ_INPUT_CHUNKED);
@@ -597,7 +613,8 @@ public:
 		katom_inc64((void*)&kgl_total_requests);
 		set_state(STATE_RECV);
 		assert(data.url == NULL);
-		if (!data.raw_url.host) {
+		if (!data.raw_url.host || (data.http_version >= 0x200 && !input_headers.complete(true)) ||
+			(data.http_version == 0x101 && !host_seen)) {
 			return false;
 		}
 		data.url = new KUrl(true);
@@ -651,7 +668,17 @@ public:
 	KRequestData data;
 	friend class KHttp2;
 protected:
+	bool response_has_trailers = false;
+	void note_response_header(const char* name, int nlen, const char* value, int vlen) {
+		if (khttp_field_equal(name, nlen, "trailer") ||
+			(khttp_field_equal(name, nlen, "content-type") && vlen>=16 && strncasecmp(value,"application/grpc",16)==0)) response_has_trailers=true;
+	}
+	KHttpHeaderValidation input_headers{};
+	bool host_seen = false;
 	void start_parse() {
+		input_headers.reset();
+		host_seen = false;
+		response_has_trailers = false;
 		if (KBIT_TEST(get_server_model(), WORK_MODEL_SSL)) {
 			KBIT_SET(data.raw_url.flags, KGL_URL_SSL | KGL_URL_ORIG_SSL);
 		}

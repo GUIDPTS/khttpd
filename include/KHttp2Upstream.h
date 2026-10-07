@@ -4,6 +4,7 @@
 #ifdef ENABLE_UPSTREAM_HTTP2
 #include "KPoolableSocketContainer.h"
 #include "KUpstream.h"
+#include <string>
 class KHttp2Upstream : public KUpstream
 {
 public:
@@ -15,6 +16,7 @@ public:
 		data = NULL;
 	}
 	~KHttp2Upstream() {
+		free_header_list(initial_headers.header);
 		kassert(pool == NULL);
 		kassert(http2 == NULL);
 		kassert(ctx == NULL);
@@ -93,6 +95,7 @@ public:
 	bool IsMultiStream() override {
 		return true;
 	}
+	void set_duplex(bool enabled) override { ctx->duplex = enabled; }
 
 	sockaddr_i* GetAddr() override {
 		return &http2->c->addr;
@@ -123,8 +126,12 @@ public:
 			pool = NULL;
 		}
 	}
-	bool parse_header(const char* attr, int attr_len, const char* val, int val_len);
+	bool parse_header(const char* attr, int attr_len, const char* val, int val_len, bool end_stream = false);
+	bool finish_headers();
+	const std::string& get_upgrade_protocol() const { return upgrade_protocol; }
 private:
+	std::string upgrade_protocol;
+	KHttpHeaderManager initial_headers{};
 	KOPAQUE data;
 	KHttp2* http2;
 	KHttp2Context* ctx;
@@ -132,4 +139,3 @@ private:
 };
 #endif
 #endif
-

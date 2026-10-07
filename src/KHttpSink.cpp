@@ -245,8 +245,13 @@ bool KHttpSink::skip_post() {
 	return true;
 }
 bool KHttpSink::response_trailer(const char* name, int name_len, const char* val, int val_len) {
+	if (!khttp_valid_trailer(name, name_len, val, val_len)) return false;
 	if (!KBIT_TEST(data.flags, RQ_TE_CHUNKED)) {
 		return true;
+	}
+	if (!rc.empty()) {
+		if (KSingleConnectionSink::write_buf(rc.get_buf(), rc.get_len(), nullptr) != 0) return false;
+		rc.clean();
 	}
 	WSABUF bufs[5];
 	int bc = 0;

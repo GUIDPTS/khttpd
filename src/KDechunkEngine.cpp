@@ -1,137 +1,97 @@
 #include "KDechunkEngine.h"
-#include "KHttpLib.h"
-KDechunkResult KDechunkEngine::dechunk(const char** buf, const char* end, const char** piece, int* piece_length) {
-	int length;
-restart:
-	switch (chunk_size) {
-	case KHTTPD_CHUNK_STATUS_IS_FAILED:
-		assert(false);
-		return KDechunkResult::Failed;
-	case KHTTPD_CHUNK_STATUS_IS_END:
-		assert(false);
-		return KDechunkResult::End;
-	case KHTTPD_CHUNK_STATUS_READ_LAST:
-	case KHTTPD_CHUNK_STATUS_READ_END:
-	{
-		const char* next_line = (const char*)memchr(*buf, '\n', end - (*buf));
-		if (next_line == NULL) {
-			if (chunk_size == KHTTPD_CHUNK_STATUS_READ_END) {
-				*buf = end;
-			} else if (end - (*buf) > KHTTPD_MAX_TRAILER_LINE) {
-				chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-				return KDechunkResult::Failed;
+#include "KHttpValidation.h"
+
+static bool chunk_line(const std::string& line, uint32_t& size) {
+	size_t i = 0;
+	size = 0;
+	while (i < line.size()) {
+		unsigned char c = (unsigned char)line[i];
+		int digit = c >= '0' && c <= '9' ? c - '0' :
+			(c >= 'a' && c <= 'f' ? c - 'a' + 10 : (c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1));
+		if (digit < 0) break;
+		if (size > (KHTTPD_MAX_CHUNK_SIZE - digit) / 16) return false;
+		size = size * 16 + digit;
+		++i;
+	}
+	if (i == 0) return false;
+	while (i < line.size()) {
+		while (i < line.size() && (line[i]==' ' || line[i]=='\t')) ++i;
+		if (i == line.size() || line[i++] != ';') return false;
+		while (i < line.size() && (line[i]==' ' || line[i]=='\t')) ++i;
+		size_t start = i;
+		while (i < line.size() && khttp_is_token((unsigned char)line[i])) ++i;
+		if (start == i) return false;
+		while (i < line.size() && (line[i]==' ' || line[i]=='\t')) ++i;
+		if (i < line.size() && line[i]=='=') {
+			++i;
+			while (i < line.size() && (line[i]==' ' || line[i]=='\t')) ++i;
+			if (i < line.size() && line[i]=='"') {
+				++i;
+				bool closed = false;
+				while (i < line.size()) {
+					unsigned char c = (unsigned char)line[i++];
+					if (c=='"') { closed=true; break; }
+					if (c=='\\') {
+						if (i == line.size()) return false;
+						c=(unsigned char)line[i++];
+					}
+					if ((c < 32 && c != '\t') || c==127) return false;
+				}
+				if (!closed) return false;
+			} else {
+				start=i;
+				while (i < line.size() && khttp_is_token((unsigned char)line[i])) ++i;
+				if (start==i) return false;
 			}
-			return KDechunkResult::Continue;
 		}
-		if (chunk_size == KHTTPD_CHUNK_STATUS_READ_LAST) {
-			if (next_line - (*buf) > KHTTPD_MAX_TRAILER_LINE) {
-				chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-				return KDechunkResult::Failed;
-			}
-			//trim left
-			while ((*buf) < next_line && isspace((unsigned char)*(*buf))) {
-				(*buf)++;
-			}
-			const char* trailer_end = next_line;
-			//trim right
-			while (trailer_end > (*buf) && isspace((unsigned char)*trailer_end)) {
-				trailer_end--;
-			}
-			if (*buf == next_line) {
-				(*buf) = next_line + 1;
-				chunk_size = KHTTPD_CHUNK_STATUS_IS_END;
-				return KDechunkResult::End;
-			}
-			if (++trailer_count > KHTTPD_MAX_TRAILER_COUNT) {
-				chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-				return KDechunkResult::Failed;
-			}
-			*piece = *buf;
-			*piece_length = (int)(trailer_end - (*buf) + 1);
-			(*buf) = next_line + 1;
+	}
+	return true;
+}
+KDechunkResult KDechunkEngine::dechunk(const char** buf, const char* end, const char** piece, int* piece_length) {
+	if (state==End) return KDechunkResult::End;
+	if (state==Failed || *piece_length <= 0) return KDechunkResult::Failed;
+	// Trailers own their storage, so a line can span any number of network reads.
+	if (state==Trailer && !line.empty() && !line_cr && line.back()=='\n') line.clear();
+	while (*buf < end) {
+		if (state==Data) {
+			int n = KGL_MIN(*piece_length, (int)KGL_MIN((size_t)chunk_size, (size_t)(end-*buf)));
+			*piece = *buf; *piece_length=n; *buf+=n; chunk_size-=n;
+			if (!chunk_size) state=DataCR;
+			return KDechunkResult::Success;
+		}
+		char c = *(*buf)++;
+		if (state==DataCR || state==DataLF) {
+			if (c != (state==DataCR ? '\r' : '\n')) goto failed;
+			state = state==DataCR ? DataLF : Size;
+			continue;
+		}
+		if (!line_cr) {
+			if (c=='\r') { line_cr=true; continue; }
+			if (c=='\n' || c==0 || line.size() >= KHTTPD_MAX_TRAILER_LINE) goto failed;
+			line.push_back(c);
+			continue;
+		}
+		line_cr=false;
+		if (c!='\n') goto failed;
+		if (state==Size) {
+			if (!chunk_line(line, chunk_size)) goto failed;
+			line.clear();
+			state = chunk_size ? Data : Trailer;
+			continue;
+		}
+		if (line.empty()) { state=End; return KDechunkResult::End; }
+		if (++trailer_count > KHTTPD_MAX_TRAILER_COUNT) goto failed;
+		{
+			size_t sep=line.find(':');
+			if (sep==std::string::npos || !khttp_valid_trailer(line.data(), (int)sep, line.data()+sep+1, (int)(line.size()-sep-1))) goto failed;
+			*piece_length=(int)line.size();
+			line.push_back('\n'); // Marker excluded from the returned field length.
+			*piece=line.data();
 			return KDechunkResult::Trailer;
 		}
-		(*buf) = next_line + 1;
-		chunk_size = KHTTPD_CHUNK_STATUS_READ_SIZE;
-		//这里不加break直接fallthrough,到下面status_read_chunk_size
 	}
-	default:
-		assert(KBIT_TEST(chunk_size, KHTTPD_CHUNK_STATUS) != KHTTPD_CHUNK_STATUS);
-		if (chunk_size == KHTTPD_CHUNK_STATUS_READ_SIZE ||
-			KBIT_TEST(chunk_size, KHTTPD_CHUNK_PART_SIZE) == KHTTPD_CHUNK_PART_SIZE) {
-			for (;;) {
-				if (*buf >= end) {
-					return KDechunkResult::Continue;
-				}
-				u_char ch = *((u_char*)*buf);
-				if (ch == '\n') {
-					if (chunk_size == KHTTPD_CHUNK_STATUS_READ_SIZE) {
-						//chunk-size must have at least one hex digit.
-						chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-						return KDechunkResult::Failed;
-					}
-					KBIT_CLR(chunk_size, KHTTPD_CHUNK_STATUS_PREFIX);
-					(*buf)++;
-					if (chunk_size == 0) {
-						chunk_size = KHTTPD_CHUNK_STATUS_READ_LAST;
-						goto restart;
-					}
-					break;
-				}
-				if (KBIT_TEST(chunk_size, KHTTPD_CHUNK_PART_SIZE_END) == KHTTPD_CHUNK_PART_SIZE_END) {
-					goto next_buf;
-				}
-				if (((chunk_size) & ~(KHTTPD_CHUNK_STATUS_PREFIX)) > (KHTTPD_MAX_CHUNK_SIZE >> 4)) {
-					//next digit will overflow uint32 and may wrap to a small size.
-					if ((ch >= '0' && ch <= '9') || ((ch | 0x20) >= 'a' && (ch | 0x20) <= 'f')) {
-						chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-						return KDechunkResult::Failed;
-					}
-				}
-				if (ch >= '0' && ch <= '9') {
-					uint32_t new_chunk_size = ((chunk_size) & ~(KHTTPD_CHUNK_STATUS_PREFIX)) * 16 + (ch - '0');
-					if (new_chunk_size > KHTTPD_MAX_CHUNK_SIZE) {
-						chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-						return KDechunkResult::Failed;
-					}
-					chunk_size = new_chunk_size | KHTTPD_CHUNK_PART_SIZE;
-					goto next_buf;
-				}
-				ch = (u_char)(ch | 0x20);
-				if (ch >= 'a' && ch <= 'f') {
-					uint32_t new_chunk_size = ((chunk_size) & ~(KHTTPD_CHUNK_STATUS_PREFIX)) * 16 + (ch - 'a' + 10);
-					if (new_chunk_size > KHTTPD_MAX_CHUNK_SIZE) {
-						chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-						return KDechunkResult::Failed;
-					}
-					chunk_size = new_chunk_size | KHTTPD_CHUNK_PART_SIZE;
-					goto next_buf;
-				}
-				if (chunk_size == KHTTPD_CHUNK_STATUS_READ_SIZE) {
-					chunk_size = KHTTPD_CHUNK_STATUS_IS_FAILED;
-					return KDechunkResult::Failed;
-				}
-				KBIT_SET(chunk_size, KHTTPD_CHUNK_PART_SIZE_END);
-			next_buf:
-				(*buf)++;
-			}
-		}
-		assert(*piece_length >= 0 && *piece_length <= KHTTPD_MAX_CHUNK_SIZE);
-		assert(KBIT_TEST(chunk_size, KHTTPD_CHUNK_STATUS_PREFIX) == 0);
-		assert(chunk_size > 0);
-		length = (int)(end - *buf);
-		length = KGL_MIN((int)chunk_size, length);
-		if (length <= 0) {
-			return KDechunkResult::Continue;
-		}
-		length = KGL_MIN(*piece_length, length);
-		*piece = *buf;
-		*piece_length = length;
-		(*buf) += length;
-		chunk_size -= length;
-		if (chunk_size == 0) {
-			chunk_size = KHTTPD_CHUNK_STATUS_READ_END;
-		}
-		return KDechunkResult::Success;
-	}
+	return KDechunkResult::Continue;
+failed:
+	state=Failed;
+	return KDechunkResult::Failed;
 }

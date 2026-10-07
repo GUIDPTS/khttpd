@@ -57,8 +57,15 @@ INLINE kgl_parse_result khttp_parse_header(khttp_parser* parser, char* header, c
 	char* sep = val;
 	*val = '\0';
 	val++;
-	while (*val && KHTTP_ISSPACE(*val)) {
+	while (val < end && (*val == ' ' || (!request_line && *val == '\t'))) {
 		val++;
+	}
+	if (!request_line) {
+		while (end > val && (end[-1] == ' ' || end[-1] == '\t')) --end;
+	}
+	for (char* p = val; p < end; ++p) {
+		unsigned char c = (unsigned char)*p;
+		if ((c < 32 && c != '\t') || c == 127) return kgl_parse_error;
 	}
 	char* header_end = header;
 	while (*header_end && !KHTTP_ISSPACE(*header_end)) {
@@ -94,6 +101,7 @@ restart:
 		return kgl_parse_continue;
 	}
 	if (*start[0] == '\n' || *start[0] == '\r') {
+		if (pn != *start && !(pn == *start + 1 && **start == '\r')) return kgl_parse_error;
 		int checked = (int)(pn + 1 - *start);
 		parser->header_len += checked;
 		*start += checked;
@@ -139,7 +147,7 @@ restart:
 	char* hot = *start;
 	*start += checked;
 	assert(*start <= end);
-	if (checked > 3 && *(pn - 1) == '\r') {
+	if (pn > hot && *(pn - 1) == '\r') {
 		pn--;
 	}
 	*pn = '\0';

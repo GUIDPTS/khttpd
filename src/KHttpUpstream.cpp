@@ -64,6 +64,7 @@ KGL_RESULT KHttpUpstream::read_header()
 	KGL_RESULT result = KGL_OK;
 	khttp_parser parser;
 	memset(&parser, 0, sizeof(parser));
+	unsigned field_count = 0;
 	if (ctx.read_buffer == nullptr) {
 		ctx.read_buffer = ks_buffer_new(8192);
 	}
@@ -110,7 +111,7 @@ KGL_RESULT KHttpUpstream::read_header()
 			}
 			case kgl_parse_success:
 			{
-				if (!stack.header(this, stack.arg, rs.attr, rs.attr_len, rs.val, rs.val_len, rs.is_first)) {
+				if (rs.bad_name || ++field_count > 1024 || !stack.header(this, stack.arg, rs.attr, rs.attr_len, rs.val, rs.val_len, rs.is_first)) {
 					result = KGL_EDATA_FORMAT;
 					goto out;
 				}

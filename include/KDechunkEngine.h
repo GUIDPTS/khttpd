@@ -5,6 +5,7 @@
 #include <string.h>
 #include "kmalloc.h"
 #include "kbuf.h"
+#include <string>
 
 enum class KDechunkResult
 {
@@ -39,8 +40,10 @@ class KDechunkEngine
 public:
 	KDechunkEngine()
 	{
-		chunk_size = KHTTPD_CHUNK_STATUS_READ_SIZE;
+		state = Size;
+		chunk_size = 0;
 		trailer_count = 0;
+		line_cr = false;
 	}
 	//piece_length是in,out参数，in时指示最大块长度
 	//如果返回的是trailer数据，piece_length会忽略传进来的值。
@@ -49,11 +52,14 @@ public:
 		return dechunk(buf, (*buf) + buf_len, piece, piece_length);
 	}
 	bool is_success() {
-		return chunk_size == KHTTPD_CHUNK_STATUS_IS_END;
+		return state == End;
 	}
 private:
+	enum State { Size, Data, DataCR, DataLF, Trailer, End, Failed } state;
 	uint32_t chunk_size;
 	uint32_t trailer_count;
+	bool line_cr;
+	std::string line;
 };
 
 class KDechunkReader

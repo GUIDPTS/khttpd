@@ -13,6 +13,7 @@
 #include "KMutex.h"
 #include "kconnection.h"
 #include "kmalloc.h"
+#include "KHttpValidation.h"
 #ifdef ENABLE_HTTP2
 #define MAX_HTTP2_BUFFER_SIZE 16
 #define  KGL_SUCCESS     0
@@ -247,6 +248,7 @@ struct kgl_http_v2_state_t
 	kgl_pool_t* pool;
 	kgl_http_v2_header_t             header;
 	uint32_t                         header_length;
+	KHttpHeaderValidation validation;
 	uint16_t                         continuation_frames;
 	uint32_t                         buffer_used;
 	u_char                           buffer[8192];
@@ -296,6 +298,11 @@ public:
 	INT64 orig_content_length;
 #endif
 	INT64 content_left;
+	int64_t input_left;
+	uint8_t duplex : 1;
+	uint8_t defer_end : 1;
+	uint8_t head_request : 1;
+	uint8_t interim_count;
 	int64_t	active_msec;
 	kgl_list queue;
 	uint8_t tmo_left;
@@ -407,7 +414,7 @@ public:
 		data->stream_id = ntohl(node->id);
 		if (content_left > 0) {
 			content_left -= total_len;
-			if (content_left <= 0) {
+			if (content_left <= 0 && !defer_end) {
 				data->flags |= KGL_HTTP_V2_END_STREAM_FLAG;
 				out_closed = 1;
 				kassert(content_left == 0);
@@ -450,6 +457,7 @@ public:
 	}
 	void Init(int send_window) {
 		memset(this, 0, sizeof(KHttp2Context));
+		input_left = -1;
 		recv_window = KGL_HTTP_V2_STREAM_RECV_WINDOW;
 		this->send_window = send_window;
 #ifndef NDEBUG
@@ -535,6 +543,7 @@ public:
 	void release_stream(KHttp2Context* ctx);
 	void release_admin(KHttp2Context* ctx);
 	int send_header(KHttp2Context* ctx, bool fin);
+	void cancel_read(KHttp2Context* ctx);
 	void write_end(KHttp2Context* ctx);
 public:
 

@@ -17,6 +17,7 @@ bool KDechunkContext::read_from_net(kconnection* cn) {
 	return true;
 }
 int KDechunkContext::read(kconnection* cn, char* buf, int length) {
+	if (is_success()) return 0;
 	const char* piece;
 	for (;;) {
 		const char* end = buffer.buf + buffer.used;
@@ -44,7 +45,8 @@ int KDechunkContext::read(kconnection* cn, char* buf, int length) {
 			while (sp < trailer_end && KHTTP_ISSPACE((unsigned char)*sp)) {
 				sp++;
 			}
-			get_trailer()->add_header(piece, attr_len, sp, (hlen_t)(trailer_end - sp));
+			while (trailer_end > sp && (trailer_end[-1]==' ' || trailer_end[-1]=='\t')) --trailer_end;
+			if (!get_trailer()->add_header(piece, attr_len, sp, (hlen_t)(trailer_end - sp))) return -1;
 			goto continue_dechunk;
 		}
 		case KDechunkResult::End:

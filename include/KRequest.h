@@ -136,7 +136,10 @@ protected:
 		if (!raw_url.host) {
 			return parse_url_host(&raw_url, val, len);
 		}
-		return true;
+		KUrl authority(false);
+		authority.flags = raw_url.flags;
+		if (!parse_url_host(&authority, val, len)) return false;
+		return strcasecmp(raw_url.host, authority.host) == 0 && raw_url.port == authority.port;
 	}
 	bool parse_http_version(u_char* ver, size_t len) {
 		/* HTTP-version = HTTP-name "/" DIGIT "." DIGIT (RFC 9112). */

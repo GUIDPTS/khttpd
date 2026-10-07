@@ -596,43 +596,56 @@ std::string url_encode(const char* str, size_t len_string) {
 }
 bool parse_url_host(kgl_url* url, const char* val, size_t len) {
 	assert(url->host == NULL);
-	char* port;
+	if (len == 0) return false;
+	const char* port = nullptr;
+	size_t port_len = 0;
+	bool ipv6 = false;
 	if (*val == '[') {
-		KBIT_SET(url->flags, KGL_URL_IPV6);
+		ipv6 = true;
 		val++;
 		len--;
-		char* host_end = (char*)memchr(val, ']', len);
+		const char* host_end = (const char*)memchr(val, ']', len);
 		if (host_end == NULL) {
 			return false;
 		}
 		size_t host_len = host_end - val;
-		port = (char*)memchr(host_end, ':', len - host_len);
-		if (port) {
-			size_t port_len = len - host_len;
-			port_len -= (port - host_end);
-			url->port = (uint16_t)kgl_atoi((u_char*)port + 1, port_len - 1);
+		if (host_len + 1 < len) {
+			if (host_end[1] != ':') return false;
+			port = host_end + 2;
+			port_len = len - host_len - 2;
 		}
 		len = host_len;
+		if (!memchr(val, ':', len)) return false;
 	} else {
-		port = (char*)memchr(val, ':', len);
+		port = (const char*)memchr(val, ':', len);
 		if (port) {
-			size_t port_len = len;
-			len = port - val;
-			port_len -= len;
-			url->port = (uint16_t)kgl_atoi((u_char*)port + 1, port_len - 1);
+			port_len = len - (port - val) - 1;
+			len = port++ - val;
 		}
+	}
+	if (len == 0) return false;
+	for (size_t i=0; i<len; ++i) {
+		unsigned char c=(unsigned char)val[i];
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c=='.' || c=='-' || c=='_' || c=='~' || (ipv6 && (c==':' || c=='%'))) continue;
+		if (!ipv6 && (c=='!' || c=='$' || c=='&' || c=='\'' || c=='(' || c==')' || c=='*' || c=='+' || c==',' || c==';' || c=='=')) continue;
+		if (!ipv6 && c=='%' && i+2<len && isxdigit((unsigned char)val[i+1]) && isxdigit((unsigned char)val[i+2])) { i+=2; continue; }
+		return false;
+	}
+	uint32_t port_number = KBIT_TEST(url->flags, KGL_URL_ORIG_SSL) ? 443 : 80;
+	if (port) {
+		if (port_len == 0) return false;
+		port_number=0;
+		for (size_t i=0; i<port_len; ++i) {
+			if (port[i]<'0' || port[i]>'9' || port_number > (65535U-(port[i]-'0'))/10) return false;
+			port_number=port_number*10+port[i]-'0';
+		}
+		if (!port_number) return false;
 	}
 	url->host = kgl_strndup(val, len);
-	if (port == NULL) {
-		//no port
-		if (KBIT_TEST(url->flags, KGL_URL_ORIG_SSL)) {
-			url->port = 443;
-		} else {
-			url->port = 80;
-		}
-	} else {
-		KBIT_SET(url->flags, KGL_URL_HAS_PORT);
-	}
+	url->port = (uint16_t)port_number;
+	if (port) KBIT_SET(url->flags, KGL_URL_HAS_PORT);
+	if (ipv6) KBIT_SET(url->flags, KGL_URL_IPV6);
 	return true;
 }
 bool parse_url(const char* src, size_t len, kgl_url * url) {
@@ -1348,4 +1361,3 @@ bool kgl_adjust_range(kgl_request_range* range, int64_t* len) 	{
 	range->to = range->from + (*len) - 1;
 	return true;
 }
-
