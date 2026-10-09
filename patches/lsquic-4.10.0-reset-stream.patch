@@ -1,0 +1,107 @@
+--- a/include/lsquic.h
++++ b/include/lsquic.h
+@@ -3,6 +3,9 @@
+ 
+ #ifndef __LSQUIC_H__
+ #define __LSQUIC_H__
++
++/* Discard late IETF STREAM frames after RESET_STREAM, with final-size checks. */
++#define LSQUIC_KANGLE_RESET_STREAM_FIX 1
+ 
+ /**
+  * @file
+--- a/src/liblsquic/lsquic_stream.c
++++ b/src/liblsquic/lsquic_stream.c
+@@ -1101,6 +1101,28 @@
+         goto release_packet_frame;
+     }
+ 
++    if ((stream->sm_bflags & SMBF_IETF)
++            && (stream->stream_flags & STREAM_RST_RECVD))
++    {
++        /* RESET_STREAM already charged its final offset to flow control and
++         * dropped data_in. Reordered/retransmitted STREAM frames must not be
++         * inserted into the error placeholder and abort the whole connection.
++         * RFC 9000 Sections 3.2 and 4.5 still require final-size validation.
++         */
++        max_off = lsquic_sfcw_get_max_recv_off(&stream->fc);
++        if (DF_END(frame) > max_off
++                || (frame->data_frame.df_fin && DF_END(frame) != max_off))
++        {
++            lconn = stream->conn_pub->lconn;
++            lconn->cn_if->ci_abort_error(lconn, 0, TEC_FINAL_SIZE_ERROR,
++                "STREAM frame after reset (id: %"PRIu64") exceeds or changes "
++                "final size %"PRIu64, stream->id, max_off);
++            goto release_packet_frame;
++        }
++        rv = 0;
++        goto release_packet_frame;
++    }
++
+     got_next_offset = frame->data_frame.df_offset == stream->read_offset;
+   insert_frame:
+     ins_frame = stream->data_in->di_if->di_insert_frame(stream->data_in, frame, stream->read_offset);
+@@ -1206,6 +1228,14 @@
+ 
+     if (stream->stream_flags & STREAM_RST_RECVD)
+     {
++        if ((stream->sm_bflags & SMBF_IETF)
++                && lsquic_sfcw_get_max_recv_off(&stream->fc) != offset)
++        {
++            lconn = stream->conn_pub->lconn;
++            lconn->cn_if->ci_abort_error(lconn, 0, TEC_FINAL_SIZE_ERROR,
++                "RESET_STREAM changes final size (id: %"PRIu64")", stream->id);
++            return -1;
++        }
+         LSQ_DEBUG("ignore duplicate RST_STREAM frame");
+         return 0;
+     }
+--- a/tests/test_stream.c
++++ b/tests/test_stream.c
+@@ -351,8 +351,17 @@
+ {
+ }
+ 
++static unsigned reset_abort_count, reset_abort_code;
++static void reset_abort_error(struct lsquic_conn *conn, int is_app,
++                              unsigned code, const char *format, ...)
++{
++    ++reset_abort_count;
++    reset_abort_code = code;
++}
++
+ static const struct conn_iface our_conn_if =
+ {
++    .ci_abort_error = reset_abort_error,
+     .ci_can_write_ack = can_write_ack,
+     .ci_get_path      = get_network_path,
+     .ci_write_ack     = write_ack,
+@@ -1013,6 +1022,28 @@
+     else
+         assert(s_onreset_called.how == 2);
+ 
++    if (stream->sm_bflags & SMBF_IETF)
++    {
++        reset_abort_count = reset_abort_code = 0;
++        /* Late in-flight data, duplicate FIN, and duplicate reset are valid. */
++        s = lsquic_stream_frame_in(stream, new_frame_in(tobjs, 0, 100, 0));
++        assert(s == 0);
++        s = lsquic_stream_frame_in(stream, new_frame_in(tobjs, 100, 0, 1));
++        assert(s == 0);
++        assert(lsquic_stream_rst_in(stream, 100, 0) == 0);
++        assert(reset_abort_count == 0);
++        assert(tobjs->conn_pub.cfcw.cf_max_recv_off == 100);
++        assert(tobjs->conn_pub.cfcw.cf_read_off == 100);
++        /* Discarding frames must not relax immutable final-size checks. */
++        s = lsquic_stream_frame_in(stream, new_frame_in(tobjs, 100, 1, 0));
++        assert(s < 0 && reset_abort_code == 0x06); /* FINAL_SIZE_ERROR */
++        s = lsquic_stream_frame_in(stream, new_frame_in(tobjs, 99, 0, 1));
++        assert(s < 0 && reset_abort_code == 0x06);
++        assert(lsquic_stream_rst_in(stream, 101, 0) < 0);
++        assert(reset_abort_count == 3 && reset_abort_code == 0x06);
++        assert(tobjs->conn_pub.cfcw.cf_max_recv_off == 100);
++        assert(tobjs->conn_pub.cfcw.cf_read_off == 100);
++    }
+     /* No RST to send, we already sent FIN */
+     assert(0 == lsquic_send_ctl_n_scheduled(&tobjs->send_ctl));
+ 

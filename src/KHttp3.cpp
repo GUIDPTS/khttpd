@@ -39,7 +39,7 @@ static lsquic_stream_ctx_t* http_server_on_new_stream(void* stream_if_ctx, lsqui
 	if (cn == NULL) {
 		return NULL;
 	}
-	KHttp3Sink* sink = new KHttp3Sink(cn);
+	KHttp3Sink* sink = new KHttp3Sink(cn, stream);
 	lsquic_stream_wantread(stream, 1);
 	lsquic_stream_wantwrite(stream, 0);
 	return (lsquic_stream_ctx_t*)sink;
@@ -64,6 +64,12 @@ static void http_server_on_write(lsquic_stream_t* stream, lsquic_stream_ctx_t* s
 	assert(st_h);
 	KHttp3Sink* sink = (KHttp3Sink*)st_h;
 	sink->on_write(stream);
+}
+static void http_server_on_reset(lsquic_stream_t*, lsquic_stream_ctx_t* ctx, int how) {
+	if (ctx) ((KHttp3Sink*)ctx)->on_reset(how);
+}
+static void http_server_on_hset(lsquic_stream_t* stream, lsquic_stream_ctx_t* ctx) {
+	if (ctx) ((KHttp3Sink*)ctx)->on_headers(stream);
 }
 static void http_server_on_close(lsquic_stream_t* stream, lsquic_stream_ctx_t* st_h) {
 	if (st_h) {
@@ -383,6 +389,7 @@ kev_result h3_result_udp_recv(KOPAQUE data, void* arg, int got) {
 }
 SSL_CTX* h3_lookup_cert(void* lsquic_cert_lookup_ctx, const struct sockaddr* local, const char* hostname) {
 	KHttp3ServerEngine* h3_engine = (KHttp3ServerEngine*)lsquic_cert_lookup_ctx;
+	if (!hostname) return kgl_get_ssl_ctx(h3_engine->ssl_ctx);
 	SSL_CTX* ssl_ctx = nullptr;
 	void* sni = kgl_ssl_create_sni(h3_engine->server->get_data(), hostname, &ssl_ctx);
 	if (sni) {
@@ -391,44 +398,25 @@ SSL_CTX* h3_lookup_cert(void* lsquic_cert_lookup_ctx, const struct sockaddr* loc
 	if (ssl_ctx) {
 		return ssl_ctx;
 	}
-	return kgl_get_ssl_ctx(h3_engine->server->ssl_ctx);
+	return kgl_get_ssl_ctx(h3_engine->ssl_ctx);
 }
 SSL_CTX* ea_get_ssl_ctx(void* peer_ctx, const struct sockaddr* local) {
 	KHttp3ServerEngine* h3_engine = (KHttp3ServerEngine*)peer_ctx;
-	return kgl_get_ssl_ctx(h3_engine->server->ssl_ctx);
+	return kgl_get_ssl_ctx(h3_engine->ssl_ctx);
 }
 static void*
 interop_server_hset_create(void* hsi_ctx, lsquic_stream_t* stream, int is_push_promise) {
-	struct header_decoder* req = (struct header_decoder*)malloc(sizeof(struct header_decoder));
-	if (req == NULL) {
-		return NULL;
-	}
-	memset(req, 0, sizeof(struct header_decoder));
-	req->sink = (KHttp3Sink*)lsquic_stream_get_ctx(stream);
-	req->is_first = true;
-	return req;
+	// LSQUIC may decode an initial block before a stream context exists.
+	return new header_decoder;
 }
 static struct lsxpack_header*
 interop_server_hset_prepare_decode(void* hset_p, struct lsxpack_header* xhdr,
 	size_t req_space) {
 	struct header_decoder* req = (struct header_decoder*)hset_p;
-	if (xhdr) {
-		//LSQ_WARN("we don't reallocate headers: can't give more");
-		return NULL;
-	}
-
-	if (req->have_xhdr) {
-		if (req->decode_off + lsxpack_header_get_dec_size(&req->xhdr)
-			>= sizeof(req->decode_buf)) {
-			//LSQ_WARN("Not enough room in header");
-			return NULL;
-		}
-		req->decode_off += lsxpack_header_get_dec_size(&req->xhdr);
-	} else
-		req->have_xhdr = true;
-
-	lsxpack_header_prepare_decode(&req->xhdr, req->decode_buf,
-		req->decode_off, sizeof(req->decode_buf) - req->decode_off);
+	if (req_space > sizeof(req->decode_buf)) return NULL;
+	if (xhdr) return xhdr;
+	// Each field is copied into the header set before decoding the next one.
+	lsxpack_header_prepare_decode(&req->xhdr, req->decode_buf, 0, sizeof(req->decode_buf));
 	return &req->xhdr;
 }
 static int
@@ -436,22 +424,17 @@ interop_server_hset_add_header(void* hset_p, struct lsxpack_header* xhdr) {
 	struct header_decoder* req = (struct header_decoder*)hset_p;
 	const char* name, * value;
 	int name_len, value_len;
-	if (!xhdr) {
-		if (req->sink->data.raw_url.is_bad()) {
-			return 1;
-		}
-		return 0;
-	}
+	if (!xhdr) return 0;
 	name = lsxpack_header_get_name(xhdr);
 	value = lsxpack_header_get_value(xhdr);
 	name_len = xhdr->name_len;
 	value_len = xhdr->val_len;
-	bool result = req->sink->parse_header<const char*>(name, name_len, (char*)value, value_len, req->is_first);
-	req->is_first = false;
-	if (result) {
-		return 0;
-	}
-	return -1;
+	req->bytes += name_len + value_len + 32;
+	if (req->invalid || ++req->count > KHTTP_MAX_FIELD_COUNT || req->bytes > 64 * 1024 ||
+		!khttp_valid_field(name, name_len, value, value_len, true) ||
+		!req->fields.add_header(name, name_len, value, value_len)) req->invalid = true;
+	// Defer semantic errors to the sink, to reset only the offending stream.
+	return 0;
 }
 static void
 interop_server_hset_destroy(void* hset_p) {
@@ -470,7 +453,7 @@ void kgl_shutdown_khttp3() {
 	lsquic_global_cleanup();
 }
 bool kgl_init_khttp3() {
-	lsquic_global_init(LSQUIC_GLOBAL_SERVER | LSQUIC_GLOBAL_CLIENT);
+	if (lsquic_global_init(LSQUIC_GLOBAL_SERVER | LSQUIC_GLOBAL_CLIENT) != 0) return false;
 	//lsquic_logger_init(&logger_if, stdout, LLTS_HHMMSSUS);
 	//lsquic_set_log_level("debug");
 	memset(&http_server_if, 0, sizeof(http_server_if));
@@ -481,7 +464,11 @@ bool kgl_init_khttp3() {
 	http_server_if.on_write = http_server_on_write;
 	http_server_if.on_close = http_server_on_close;
 	http_server_if.on_goaway_received = http_server_on_goaway;
+	http_server_if.on_reset = http_server_on_reset;
+	http_server_if.on_hset_in = http_server_on_hset;
 	lsquic_engine_init_settings(&engine_settings, LSENG_SERVER);
+	engine_settings.es_versions = (1u << LSQVER_I001) | (1u << LSQVER_I002);
+	engine_settings.es_max_header_list_size = 64 * 1024;
 	engine_settings.es_rw_once = 1;
 	engine_settings.es_send_prst = 1;
 	//engine_settings.es_proc_time_thresh = LSQUIC_DF_PROC_TIME_THRESH;
@@ -493,7 +480,7 @@ bool kgl_init_khttp3() {
 	header_bypass_api.hsi_prepare_decode = interop_server_hset_prepare_decode;
 	header_bypass_api.hsi_process_header = interop_server_hset_add_header;
 	header_bypass_api.hsi_discard_header_set = interop_server_hset_destroy;
-	header_bypass_api.hsi_flags = (lsquic_hsi_flag)(LSQUIC_HSI_HTTP1X | LSQUIC_HSI_HASH_NAME | LSQUIC_HSI_HASH_NAMEVAL);
+	header_bypass_api.hsi_flags = (lsquic_hsi_flag)(LSQUIC_HSI_HASH_NAME | LSQUIC_HSI_HASH_NAMEVAL | LSQUIC_HSI_APP_CONTENT_LENGTH);
 
 	return true;
 
@@ -570,6 +557,29 @@ int KHttp3Server::shutdown() {
 	}
 	return 0;
 }
+static kev_result h3_update_ssl_ctx(KOPAQUE data, void* arg, int) {
+	auto engine = (KHttp3ServerEngine*)data;
+	auto ssl_ctx = (kgl_ssl_ctx*)arg;
+	auto old = engine->ssl_ctx;
+	engine->ssl_ctx = ssl_ctx;
+	if (old) kgl_release_ssl_ctx(old);
+	delete engine->last_sni;
+	engine->last_sni = nullptr;
+	engine->release();
+	return kev_ok;
+}
+void KHttp3Server::update_ssl_ctx(kgl_ssl_ctx* next) {
+	if (!next || next == ssl_ctx) return;
+	kgl_add_ref_ssl_ctx(next);
+	auto old = ssl_ctx;
+	ssl_ctx = next;
+	if (old) kgl_release_ssl_ctx(old);
+	for (int i = 0; i < engine_count; i++) {
+		kgl_add_ref_ssl_ctx(next);
+		addRef();
+		kgl_selector_module.next(get_selector_by_index(i), engines[i], h3_update_ssl_ctx, next, 0);
+	}
+}
 int KHttp3Server::init(const char* ip, uint16_t port, int sock_flags, kgl_ssl_ctx* ssl_ctx, uint32_t model) {
 	if (!ssl_ctx) {
 		return -1;
@@ -645,6 +655,8 @@ int KHttp3ServerEngine::start() {
 	return 0;
 }
 int KHttp3ServerEngine::init(kselector* selector, int udp_flag) {
+	kgl_add_ref_ssl_ctx(server->ssl_ctx);
+	ssl_ctx = server->ssl_ctx;
 	KBIT_SET(udp_flag, KSOCKET_IP_PKTINFO);
 	lsquic_engine_api engine_api = { 0 };
 	engine_api.ea_packets_out = send_packets_out;

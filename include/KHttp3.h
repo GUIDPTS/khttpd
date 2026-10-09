@@ -122,6 +122,7 @@ public:
 	KHttp3Server* server;
 	kselector_tick* selector_tick;
 	KHttp3CachedSni* last_sni = nullptr;
+	kgl_ssl_ctx* ssl_ctx = nullptr;
 	friend class KHttp3Server;
 protected:
 	~KHttp3ServerEngine()
@@ -132,6 +133,7 @@ protected:
 		if (engine) {
 			lsquic_engine_destroy(engine);
 		}
+		if (ssl_ctx) kgl_release_ssl_ctx(ssl_ctx);
 		xfree(iov_buf[1].iov_base);
 		assert(selector_tick == NULL);
 		if (last_sni) {
@@ -164,10 +166,7 @@ public:
 	{
 		return data;
 	}
-	void update_ssl_ctx(kgl_ssl_ctx* ssl_ctx)
-	{
-		//TODO: update ssl_ctx
-	}
+	void update_ssl_ctx(kgl_ssl_ctx* ssl_ctx);
 	int init(const char *ip,uint16_t port,int sock_flags, kgl_ssl_ctx* ssl_ctx,uint32_t model);
 	bool start();
 	int shutdown();

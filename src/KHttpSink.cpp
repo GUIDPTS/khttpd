@@ -8,6 +8,7 @@
 #include "KHttpServer.h"
 #include "KHttp2.h"
 #include "klog.h"
+#include <string>
 
 #define MAX_HTTP_CHUNK_SIZE 8192
 #ifdef KSOCKET_SSL
@@ -54,6 +55,26 @@ bool KHttpSink::internal_response_status(uint16_t status_code) {
 	KHttpKeyValue::get_request_line(pool, status_code, &request_line);
 	rc.head_insert_const(pool, request_line.data, (uint16_t)request_line.len);
 	return true;
+}
+bool KHttpSink::response_early_hints(const KHttpHeader* headers) {
+	if (data.http_version != 0x101 || data.status_code || KBIT_TEST(data.flags, RQ_HAS_SEND_HEADER)) return false;
+	std::string block("HTTP/1.1 103 Early Hints\r\n");
+	for (auto h = headers; h; h = h->next) {
+		const char* name = h->name_is_know ? kgl_header_type_string[h->know_header].value.data : h->buf;
+		int name_len = h->name_is_know ? (int)kgl_header_type_string[h->know_header].value.len : h->name_len;
+		block.append(name, name_len);
+		block.append(": ");
+		block.append(h->buf + h->val_offset, h->val_len);
+		block.append("\r\n");
+	}
+	block.append("\r\n");
+	// Do not use rc: request rules may already have queued final-response fields.
+	kbuf buf{};
+	buf.data = const_cast<char*>(block.data());
+	buf.used = (int)block.size();
+	bool success = KSingleConnectionSink::write_buf(&buf, buf.used, nullptr) == 0;
+	flush();
+	return success;
 }
 #ifdef ENABLE_HTTP2
 static kev_result h2c_process(KOPAQUE data, void* arg, int got) {

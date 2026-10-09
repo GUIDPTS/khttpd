@@ -132,6 +132,8 @@ public:
 	virtual bool response_trailer(const char* name, int name_len, const char* val, int val_len) {
 		return true;
 	}
+	// Informational responses must not alter the final response's state.
+	virtual bool response_early_hints(const KHttpHeader* headers) { return false; }
 	void enable_response_trailers() { response_has_trailers = true; }
 	virtual bool finish_read_body() { return data.left_read == 0; }
 	virtual bool need_request_end() { return get_trailer() != nullptr; }

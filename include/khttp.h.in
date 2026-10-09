@@ -322,7 +322,7 @@ typedef struct _kgl_url
 	};
 } kgl_url;
 #define KGL_HTTP_V2_NPN_ADVERTISE        "\x02h2"
-#define KGL_HTTP_V3_NPN_ADVERTISE        "\x02h3\x05h3-29"
+#define KGL_HTTP_V3_NPN_ADVERTISE        "\x02h3"
 #define KGL_HTTP_V2_NPN_NEGOTIATED       "h2"
 
 #define KGL_ALPN_HTTP1   0

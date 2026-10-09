@@ -5,6 +5,7 @@
 #include "KPoolableSocketContainer.h"
 #include "KUpstream.h"
 #include <string>
+#include <deque>
 class KHttp2Upstream : public KUpstream
 {
 public:
@@ -17,6 +18,7 @@ public:
 	}
 	~KHttp2Upstream() {
 		free_header_list(initial_headers.header);
+		for (auto& head : response_heads) free_header_list(head.headers);
 		kassert(pool == NULL);
 		kassert(http2 == NULL);
 		kassert(ctx == NULL);
@@ -132,6 +134,15 @@ public:
 private:
 	std::string upgrade_protocol;
 	KHttpHeaderManager initial_headers{};
+	struct ResponseHead {
+		int status;
+		KHttpHeader* headers;
+	};
+	std::deque<ResponseHead> response_heads;
+	int pending_status = 0;
+	bool terminal_headers = false;
+	kgl_header_callback header_callback = nullptr;
+	void* header_arg = nullptr;
 	KOPAQUE data;
 	KHttp2* http2;
 	KHttp2Context* ctx;

@@ -14,6 +14,7 @@ class KHttpSink final : public KSingleConnectionSink
 public:
 	KHttpSink(kconnection* c, kgl_pool_t* pool);
 	~KHttpSink();
+	bool response_early_hints(const KHttpHeader* headers) override;
 	virtual bool is_locked() override {
 		return KBIT_TEST(cn->st.base.st_flags, STF_LOCK);
 	}

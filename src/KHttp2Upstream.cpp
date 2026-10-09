@@ -5,59 +5,42 @@
 
 #ifdef ENABLE_UPSTREAM_HTTP2
 bool KHttp2Upstream::parse_header(const char* attr, int attr_len, const char* val, int val_len, bool end_stream) {
-	int status_code;
-	// Delay regular fields of a terminal first HEADERS block until we know
-	// whether it is a gRPC trailers-only response. Custom metadata belongs
-	// to trailers as well as grpc-status and grpc-message in that case.
-	if (!ctx->parsed_header && end_stream && attr_len && attr[0] != ':') {
-		return initial_headers.add_header(attr, attr_len, val, val_len) != nullptr;
+	if (ctx->parsed_header) {
+		return ctx->get_trailer_header()->add_header(attr, attr_len, val, val_len) != nullptr;
 	}
+	terminal_headers = end_stream;
 	if (kgl_mem_same(attr, attr_len, _KS(":status"))) {
-		status_code = (int)kgl_atol((u_char *)val, val_len);
-		if (ctx->has_upgrade && status_code == 200) status_code = 101;
-		attr = NULL;
-		attr_len = (int)kgl_header_status;
-		val = (char*)&status_code;
-		val_len = KGL_HEADER_VALUE_INT;
-		if (status_code >= 100 && status_code < 200 && status_code != 101) {
+		pending_status = (int)kgl_atol((u_char *)val, val_len);
+		if (ctx->has_upgrade && pending_status == 200) pending_status = 101;
+		if (pending_status >= 100 && pending_status < 200 && pending_status != 101) {
 			//next headers is not trailer header
 			ctx->is_100_continue = 1;
 			assert(ctx->parsed_header == 0);
-			goto skip_trailer;
 		}
+		return true;
 	}
-	if (ctx->parsed_header) {
-		if (attr) {
-			return ctx->get_trailer_header()->add_header(attr, attr_len, val, val_len) != nullptr;
-		}
-		return ctx->get_trailer_header()->add_header((kgl_header_type)attr_len, val, val_len) != nullptr;
-	}
-skip_trailer:
-	kgl_http2_event* re = ctx->read_wait;
-	if (re) {
-		//client模式中在等待读header的过程中，有可能就会被客户端connection broken而导致shutdown.
-		kassert(re->header);
-		return re->header(this, re->header_arg, attr, attr_len, val, val_len, false);
-	}
-	return true;
+	// Delivery happens in read_header's fiber. Writing an interim response can
+	// yield, while this connection's parser receives more complete HEADERS blocks.
+	return initial_headers.add_header(attr, attr_len, val, val_len) != nullptr;
 }
 bool KHttp2Upstream::finish_headers() {
-	bool grpc = initial_headers.find(_KS("grpc-status")) != nullptr;
-	bool success = true;
-	for (auto h = initial_headers.header; h; h = h->next) {
-		kgl_str_t name;
-		kgl_get_header_name(h, &name);
-		const char* value = h->buf + h->val_offset;
-		if (grpc && khttp_valid_trailer(name.data, (int)name.len, value, h->val_len)) {
-			success = ctx->get_trailer_header()->add_header(name.data, (int)name.len, value, h->val_len) != nullptr;
-		} else if (ctx->read_wait) {
-			auto re = ctx->read_wait;
-			success = re->header(this, re->header_arg, name.data, (int)name.len, value, h->val_len, false);
-		}
-		if (!success) break;
+	if (ctx->parsed_header) return true;
+	if (!pending_status || response_heads.size() >= 9) return false;
+	bool grpc = terminal_headers && initial_headers.find(_KS("grpc-status")) != nullptr;
+	KHttpHeaderManager fields{};
+	auto h = initial_headers.steal_header();
+	while (h) {
+		auto next = h->next;
+		h->next = nullptr;
+		if (grpc && khttp_valid_trailer(h->buf, h->name_len, h->buf + h->val_offset, h->val_len)) {
+			ctx->get_trailer_header()->insert(h);
+		} else fields.insert(h);
+		h = next;
 	}
-	free_header_list(initial_headers.steal_header());
-	return success;
+	response_heads.push_back({pending_status, fields.steal_header()});
+	pending_status = 0;
+	terminal_headers = false;
+	return true;
 }
 bool KHttp2Upstream::set_header_callback(void* arg, kgl_header_callback header) {
 	assert(kselector_is_same_thread(http2->c->st.base.selector));
@@ -67,6 +50,8 @@ bool KHttp2Upstream::set_header_callback(void* arg, kgl_header_callback header) 
 	e->header_arg = arg;
 	e->header = header;
 	ctx->read_wait = e;
+	header_callback = header;
+	header_arg = arg;
 	return true;
 }
 KGL_RESULT KHttp2Upstream::read_header() {
@@ -74,10 +59,17 @@ KGL_RESULT KHttp2Upstream::read_header() {
 	if (ctx->send_header) {
 		http2->send_header(ctx, ctx->content_left == 0 && !ctx->defer_end);
 	}
-	if (0 == http2->ReadHeader(ctx)) {
-		return KGL_OK;
+	if (response_heads.empty() && http2->ReadHeader(ctx) != 0) return KGL_EUNKNOW;
+	if (response_heads.empty()) return KGL_EUNKNOW;
+	auto head = response_heads.front();
+	response_heads.pop_front();
+	bool success = header_callback(this, header_arg, nullptr, (int)kgl_header_status,
+		(const char*)&head.status, KGL_HEADER_VALUE_INT, false);
+	for (auto h = head.headers; success && h; h = h->next) {
+		success = header_callback(this, header_arg, h->buf, h->name_len, h->buf + h->val_offset, h->val_len, false);
 	}
-	return KGL_EUNKNOW;
+	free_header_list(head.headers);
+	return success ? KGL_OK : KGL_EDATA_FORMAT;
 }
 KUpstream* KHttp2Upstream::NewStream() {
 	kassert(this->ctx->admin_stream);

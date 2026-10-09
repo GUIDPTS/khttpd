@@ -60,6 +60,11 @@ KGL_RESULT KHttpUpstream::send_header_complete()
 KGL_RESULT KHttpUpstream::read_header()
 {
 	read_header_time = kgl_current_sec;
+	// HTTP/3 uploads can finish in a separate, tiny chunk after the headers.
+	// Flush corked data and disable Nagle before awaiting the response: otherwise
+	// the origin can wait for that chunk while TCP waits for a delayed ACK.
+	set_no_delay(false);
+	set_no_delay(true);
 	assert(stack.header);
 	KGL_RESULT result = KGL_OK;
 	khttp_parser parser;

@@ -640,17 +640,21 @@ bool KHttp2::on_header_success(KHttp2Context* stream) {
 #ifdef ENABLE_UPSTREAM_HTTP2
 	if (client_model) {
 		if (stream->has_upgrade && !stream->parsed_header && state.validation.status == 200) {
-			kgl_http2_event* re = stream->read_wait;
-			if (re) {
-				const auto& protocol = stream->us->get_upgrade_protocol();
-				re->header(stream->us, re->header_arg, _KS("Upgrade"), protocol.data(), (int)protocol.size(), false);
-				re->header(stream->us, re->header_arg, _KS("Connection"), _KS("Upgrade"), false);
+			const auto& protocol = stream->us->get_upgrade_protocol();
+			if (!stream->us->parse_header(_KS("Upgrade"), protocol.data(), (int)protocol.size()) ||
+				!stream->us->parse_header(_KS("Connection"), _KS("Upgrade"))) {
+				terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+				return true;
 			}
 		}
 		if (stream->is_100_continue) {
 			stream->is_100_continue = 0;
 			stream->input_left = -1;
 			if ((state.flags & KGL_HTTP_V2_END_STREAM_FLAG) || ++stream->interim_count > 8) {
+				terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
+				return true;
+			}
+			if (!stream->us->finish_headers()) {
 				terminate_stream(stream, KGL_HTTP_V2_PROTOCOL_ERROR);
 				return true;
 			}
@@ -1180,7 +1184,7 @@ bool KHttp2::send_altsvc(KHttp2Context* ctx, const char* val, int val_len) {
 	start_write();
 	return true;
 }
-int KHttp2::send_header(KHttp2Context* http2_ctx, bool body_end) {
+int KHttp2::send_header(KHttp2Context* http2_ctx, bool body_end, bool flush) {
 	kassert(http2_ctx->send_header);
 	kassert(kselector_is_same_thread(c->st.base.selector));
 	if (read_processing == 0) {
@@ -1210,7 +1214,7 @@ int KHttp2::send_header(KHttp2Context* http2_ctx, bool body_end) {
 	int header_len = 0;
 	while (buf) {
 		header_len += buf->used;
-		if (buf->next == NULL && body_end) {
+		if (buf->next == NULL && (body_end || flush)) {
 			buf->tcp_nodelay = 1;
 		}
 		buf = buf->next;
@@ -1547,6 +1551,10 @@ int KHttp2::on_write_window_ready(KHttp2Context* http2_ctx) {
 	}
 	http2_buff* new_buf = http2_ctx->build_write_buffer(http2_ctx->write_wait, len);
 	kassert(IS_WRITE_WAIT_FOR_WRITING(http2_ctx->write_wait));
+	// Download traffic makes progress through outbound DATA and inbound
+	// WINDOW_UPDATE. Do not classify its control frames as an idle flood.
+	// Empty DATA and control-only replies must not reset the protection.
+	if (len > 0) idle_frames = 0;
 	http2_ctx->send_window -= len;
 	send_window -= len;
 	write_buffer.push(new_buf);

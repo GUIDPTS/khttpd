@@ -542,7 +542,7 @@ public:
 	void release(KHttp2Context* ctx);
 	void release_stream(KHttp2Context* ctx);
 	void release_admin(KHttp2Context* ctx);
-	int send_header(KHttp2Context* ctx, bool fin);
+	int send_header(KHttp2Context* ctx, bool fin, bool flush = false);
 	void cancel_read(KHttp2Context* ctx);
 	void write_end(KHttp2Context* ctx);
 public:

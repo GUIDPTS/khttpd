@@ -1,0 +1,29 @@
+diff --git a/include/lsquic.h b/include/lsquic.h
+--- a/include/lsquic.h
++++ b/include/lsquic.h
+@@ -1360,6 +1360,12 @@ enum lsquic_hsi_flag {
+     LSQUIC_HSI_HASH_NAME       = 1 << 2,
+     /** Include nameval hash into lsxpack_header */
+     LSQUIC_HSI_HASH_NAMEVAL    = 1 << 3,
++    /**
++     * The application validates Content-Length and DATA length, including
++     * trailers, and resets malformed messages with H3_MESSAGE_ERROR.
++     * Keep the default connection-level validation for other applications.
++     */
++    LSQUIC_HSI_APP_CONTENT_LENGTH = 1 << 4,
+ };
+ 
+ struct lsquic_hset_if
+diff --git a/src/liblsquic/lsquic_qdec_hdl.c b/src/liblsquic/lsquic_qdec_hdl.c
+--- a/src/liblsquic/lsquic_qdec_hdl.c
++++ b/src/liblsquic/lsquic_qdec_hdl.c
+@@ -596,7 +596,8 @@ qdh_process_header (void *stream_p, struct lsxpack_header *xhdr)
+     union hblock_ctx *const u = stream->sm_hblock_ctx;
+     struct qpack_dec_hdl *const qdh = u->ctx.qdh;
+ 
+-    if (is_content_length(xhdr))
++    if (is_content_length(xhdr) && !(qdh->qdh_enpub->enp_hsi_if->hsi_flags
++                                   & LSQUIC_HSI_APP_CONTENT_LENGTH))
+     {
+         process_content_length(qdh, &u->ctx.cont_len,
+                                     lsxpack_header_get_value(xhdr),

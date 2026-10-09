@@ -63,6 +63,16 @@ public:
 	virtual bool response_headers(const KHttpHeader* header) override {
 		return khttpd::response_headers<KHttp2Sink>(this, header);
 	}
+	bool response_early_hints(const KHttpHeader* headers) override {
+		if (data.status_code || ctx->out_closed || KBIT_TEST(data.flags, RQ_HAS_SEND_HEADER)) return false;
+		auto pending = ctx->send_header;
+		ctx->send_header = nullptr;
+		bool success = http2->add_status(ctx, 103) && response_headers(headers);
+		if (success) success = http2->send_header(ctx, false, true) > 0;
+		delete ctx->send_header;
+		ctx->send_header = pending;
+		return success;
+	}
 	//返回头长度,-1表示出错
 	int internal_start_response_body(int64_t body_size, bool is_100_continue) override {
 		if (is_100_continue) {
