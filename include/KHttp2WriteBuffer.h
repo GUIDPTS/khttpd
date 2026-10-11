@@ -21,7 +21,11 @@
 #define IS_WRITE_WAIT_FOR_HUP(we)		(we->buf==NULL)
 #define IS_WRITE_WAIT_FOR_WRITING(we)	(we->len>=0 && we->buf!=NULL)
 
+// Windows has no TCP_CORK. Enabling Nagle is not an equivalent batching
+// mechanism: HTTP/2 control/data frames can wait for delayed acknowledgments.
+#ifndef _WIN32
 #define ENABLE_HTTP2_TCP_CORK 1
+#endif
 class KHttp2Context;
 class KHttp2;
 class http2_buff;

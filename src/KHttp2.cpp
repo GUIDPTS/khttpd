@@ -1363,6 +1363,10 @@ bool KHttp2::add_header(KHttp2Context* ctx, const char* name, hlen_t name_len, c
 void KHttp2::init(kconnection* c) {
 	//printf("Http2 init [%p]\n", this);
 	this->c = c;
+#ifdef _WIN32
+	// Keep control frames and multiplexed responses independent of Nagle delays.
+	ksocket_no_delay(c->st.fd, true);
+#endif
 	KBIT_SET(c->st.base.st_flags, STF_RTIME_OUT);
 	read_processing = 1;
 	send_window = KGL_HTTP_V2_DEFAULT_WINDOW;
