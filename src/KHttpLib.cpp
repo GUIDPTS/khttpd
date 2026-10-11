@@ -594,7 +594,7 @@ std::string url_encode(const char* str, size_t len_string) {
 	}
 	return s;
 }
-bool parse_url_host(kgl_url* url, const char* val, size_t len) {
+static bool parse_url_host_impl(kgl_url* url, const char* val, size_t len, bool allow_zero_port) {
 	assert(url->host == NULL);
 	if (len == 0) return false;
 	const char* port = nullptr;
@@ -640,7 +640,7 @@ bool parse_url_host(kgl_url* url, const char* val, size_t len) {
 			if (port[i]<'0' || port[i]>'9' || port_number > (65535U-(port[i]-'0'))/10) return false;
 			port_number=port_number*10+port[i]-'0';
 		}
-		if (!port_number) return false;
+		if (!port_number && !allow_zero_port) return false;
 	}
 	url->host = kgl_strndup(val, len);
 	url->port = (uint16_t)port_number;
@@ -648,7 +648,10 @@ bool parse_url_host(kgl_url* url, const char* val, size_t len) {
 	if (ipv6) KBIT_SET(url->flags, KGL_URL_IPV6);
 	return true;
 }
-bool parse_url(const char* src, size_t len, kgl_url * url) {
+bool parse_url_host(kgl_url* url, const char* val, size_t len) {
+	return parse_url_host_impl(url, val, len, false);
+}
+static bool parse_url_impl(const char* src, size_t len, kgl_url* url, bool allow_zero_port) {
 	const char* host, * path;
 	if (len == 0) {
 		return false;
@@ -684,7 +687,7 @@ bool parse_url(const char* src, size_t len, kgl_url * url) {
 		//h2/h3 :authority already set the host.
 		return false;
 	}
-	if (!parse_url_host(url, host, host_len)) {
+	if (!parse_url_host_impl(url, host, host_len, allow_zero_port)) {
 		return false;
 	}
 only_path: const char* sp = (char*)memchr(path, '?', len);
@@ -706,6 +709,12 @@ only_path: const char* sp = (char*)memchr(path, '?', len);
 	assert(url->path == NULL);
 	url->path = kgl_strndup(path, path_len);
 	return true;
+}
+bool parse_url(const char* src, size_t len, kgl_url* url) {
+	return parse_url_impl(src, len, url, false);
+}
+bool parse_upstream_url(const char* src, size_t len, kgl_url* url) {
+	return parse_url_impl(src, len, url, true);
 }
 static int my_htoi(char* s) {
 	int c = ((unsigned char*)s)[0];

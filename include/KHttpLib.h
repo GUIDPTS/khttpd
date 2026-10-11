@@ -47,6 +47,12 @@ bool parse_url(const char* src, size_t len, kgl_url* url);
 inline bool parse_url(const char* src, kgl_url* url) {
 	return parse_url(src, strlen(src), url);
 }
+// Internal upstream configuration uses port 0 to inherit the request port.
+// Keep parse_url and parse_url_host strict for client HTTP messages.
+bool parse_upstream_url(const char* src, size_t len, kgl_url* url);
+inline bool parse_upstream_url(const char* src, kgl_url* url) {
+	return parse_upstream_url(src, strlen(src), url);
+}
 inline void build_url_host_port(kgl_url* url, KWStream& s) {
 	if (unlikely(KBIT_TEST(url->flags, KGL_URL_IPV6))) {
 		s.WSTR("[");
