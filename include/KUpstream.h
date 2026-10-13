@@ -43,6 +43,7 @@ class KUpstream
 public:
 	KUpstream() {
 		expire_time = 0;
+		read_header_time = 0;
 		container = NULL;
 	}
 	virtual void set_delay() {}
@@ -128,12 +129,11 @@ public:
 		return container;
 	}
 	friend class KPoolableSocketContainer;
-	union
-	{
-		time_t expire_time;
-		//记录开始读的时间，用于长连接计算超时用的。
-		time_t read_header_time;
-	};
+	// Only entering the pool sets expire_time. Reading a response must not
+	// change IsNew(), or a fresh connection is mistaken for a stale pooled one.
+	time_t expire_time;
+	// Response-read start time used to calculate the keep-alive deadline.
+	time_t read_header_time;
 	KPoolableSocketContainer* container;
 protected:
 	virtual void unbind_selector() {
