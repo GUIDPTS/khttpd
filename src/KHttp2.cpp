@@ -798,7 +798,9 @@ KHttp2Context* KHttp2::create_stream() {
 	stream->sink = sink;
 #ifdef KSOCKET_SSL
 	if (kconnection_is_ssl(c)) {
-		KBIT_SET(stream->sink->data.raw_url.flags, KGL_URL_SSL);
+		// HTTP/2 headers bypass KSink::start_parse. Set both TLS flags before
+		// parsing :authority so an omitted port defaults to 443, not 80.
+		KBIT_SET(stream->sink->data.raw_url.flags, KGL_URL_SSL | KGL_URL_ORIG_SSL);
 	}
 #endif
 	return stream;
