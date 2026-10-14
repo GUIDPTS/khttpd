@@ -174,14 +174,19 @@ inline const char* kgl_skip_space(const char* start, const char* end, bool space
 int url_decode(char* str, int len=0, kgl_url* url=NULL, bool space2plus=true);
 void CTIME_R(time_t* a, char* b, size_t l);
 inline int kgl_parse_value_time(const char* val, int val_len, time_t* value) {
+	time_t parsed;
 	if (val_len == KGL_HEADER_VALUE_TIME) {
-		*value = *(time_t*)val;
-		return 0;
+		parsed = *(const time_t*)val;
+	} else {
+		if (val_len <= 0) {
+			return -1;
+		}
+		parsed = kgl_parse_http_time((u_char*)val, val_len);
 	}
-	if (val_len <= 0) {
+	if (parsed < 0) {
 		return -1;
 	}
-	*value = kgl_parse_http_time((u_char*)val, val_len);
+	*value = parsed;
 	return 0;
 }
 inline int kgl_parse_value_int64(const char* val, int val_len, int64_t* value) {
