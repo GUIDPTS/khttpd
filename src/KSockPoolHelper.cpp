@@ -438,6 +438,8 @@ KString KSockPoolHelper::get_port() {
 }
 void KSockPoolHelper::dump(kgl::serializable* s, bool as_mserver) {
 	kgl_refs_string* str = GetParam();
+	// getSize() takes the same non-recursive lock, so read it before locking.
+	unsigned idle_size = getSize();
 	lock.Lock();
 	s->add("host", host);
 	s->add("port", get_port());
@@ -458,7 +460,7 @@ void KSockPoolHelper::dump(kgl::serializable* s, bool as_mserver) {
 		s->add("self_ip", ip);
 	}
 	s->add("sign", sign);
-	s->add("idle_size", getSize());
+	s->add("idle_size", idle_size);
 	s->add("total_connect", total_connect);
 	s->add("total_hit", total_hit);
 	s->add("total_err", total_error);
